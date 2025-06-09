@@ -3,17 +3,21 @@ use std::marker::PhantomData;
 use halo2_proofs::{
     circuit::{AssignedCell, Layouter, SimpleFloorPlanner, Value},
     dev::MockProver,
-    plonk::{Advice, Circuit, Column, ConstraintSystem, Error, Selector},
+    plonk::{Advice, Circuit, Column, ConstraintSystem, Error, Expression, Fixed, Selector},
     poly::Rotation,
 };
 
-use ff::Field;
+use ff::{Field, PrimeField};
 
 #[derive(Clone, Debug)]
 struct ArithmeticChip<F: Field> {
     _ph: PhantomData<F>,
-    q_mul: Selector,
-    q_add: Selector,
+    q_arith: Selector,
+    c0: Column<Fixed>,
+    c1: Column<Fixed>,
+    c2: Column<Fixed>,
+    cm: Column<Fixed>,
+    cc: Column<Fixed>,
     w0: Column<Advice>,
     w1: Column<Advice>,
     w2: Column<Advice>,
@@ -22,35 +26,47 @@ struct ArithmeticChip<F: Field> {
 impl<F: Field> ArithmeticChip<F> {
     fn configure(
         meta: &mut ConstraintSystem<F>,
+        c0: Column<Fixed>,
+        c1: Column<Fixed>,
+        c2: Column<Fixed>,
+        cm: Column<Fixed>,
+        cc: Column<Fixed>,
         w0: Column<Advice>,
         w1: Column<Advice>,
         w2: Column<Advice>,
     ) -> Self {
-        let q_mul = meta.complex_selector();
-        let q_add = meta.complex_selector();
+        let q_arith = meta.selector();
 
-        // define an addition gate:
-        meta.create_gate("add", |meta| {
+        meta.create_gate("arith", |meta| {
+            let q_arith = meta.query_selector(q_arith);
             let w0 = meta.query_advice(w0, Rotation::cur());
             let w1 = meta.query_advice(w1, Rotation::cur());
             let w2 = meta.query_advice(w2, Rotation::cur());
-            let q_add = meta.query_selector(q_add);
-            vec![q_add * (w0 + w1 - w2)]
-        });
 
-        // define a multiplication gate:
-        meta.create_gate("mul", |meta| {
-            let w0 = meta.query_advice(w0, Rotation::cur());
-            let w1 = meta.query_advice(w1, Rotation::cur());
-            let w2 = meta.query_advice(w2, Rotation::cur());
-            let q_mul = meta.query_selector(q_mul);
-            vec![q_mul * (w0 * w1 - w2)]
+            let c0 = meta.query_fixed(c0, Rotation::cur());
+            let c1 = meta.query_fixed(c1, Rotation::cur());
+            let c2 = meta.query_fixed(c2, Rotation::cur());
+
+            let cm = meta.query_fixed(cm, Rotation::cur());
+            let cc = meta.query_fixed(cc, Rotation::cur());
+
+            let expr = Expression::Constant(F::ZERO);
+            let expr = expr + c0 * w0.clone();
+            let expr = expr + c1 * w1.clone();
+            let expr = expr + c2 * w2.clone();
+            let expr = expr + cm * (w0 * w1);
+            let expr = expr + cc;
+            vec![q_arith * expr]
         });
 
         Self {
             _ph: PhantomData,
-            q_mul,
-            q_add,
+            q_arith,
+            c0,
+            c1,
+            c2,
+            cm,
+            cc,
             w0,
             w1,
             w2,
@@ -67,21 +83,27 @@ impl<F: Field> ArithmeticChip<F> {
             || "add",
             |mut region| {
                 // enable the addition gate
-                self.q_add.enable(&mut region, 0)?;
+                self.q_arith.enable(&mut region, 0)?;
 
                 // compute cell values
                 let w0 = lhs.value().cloned();
                 let w1 = rhs.value().cloned();
                 let w2 = w0.and_then(|w0| w1.and_then(|w1| Value::known(w0 + w1)));
-
+                
                 // assign the values to the cells
                 let w0 = region.assign_advice(|| "assign w0", self.w0, 0, || w0)?;
                 let w1 = region.assign_advice(|| "assign w1", self.w1, 0, || w1)?;
                 let w2 = region.assign_advice(|| "assign w2", self.w2, 0, || w2)?;
-
+                
                 // constrain the inputs
                 region.constrain_equal(w0.cell(), lhs.cell())?;
                 region.constrain_equal(w1.cell(), rhs.cell())?;
+
+                region.assign_fixed(|| "c0", self.c0, 0, || Value::known(F::ONE))?;
+                region.assign_fixed(|| "c1", self.c1, 0, || Value::known(F::ONE))?;
+                region.assign_fixed(|| "c2", self.c2, 0, || Value::known(-F::ONE))?;
+                region.assign_fixed(|| "cm", self.cm, 0, || Value::known(F::ZERO))?;
+                region.assign_fixed(|| "cc", self.cc, 0, || Value::known(F::ZERO))?;
 
                 Ok(w2)
             },
@@ -98,7 +120,7 @@ impl<F: Field> ArithmeticChip<F> {
             || "mul",
             |mut region| {
                 // enable the multiplication gate
-                self.q_mul.enable(&mut region, 0)?;
+                self.q_arith.enable(&mut region, 0)?;
 
                 // compute cell values
                 let w0 = lhs.value().cloned();
@@ -113,6 +135,13 @@ impl<F: Field> ArithmeticChip<F> {
                 // constrain the inputs
                 region.constrain_equal(w0.cell(), lhs.cell())?;
                 region.constrain_equal(w1.cell(), rhs.cell())?;
+
+                region.assign_fixed(|| "c0", self.c0, 0, || Value::known(F::ZERO))?;
+                region.assign_fixed(|| "c1", self.c1, 0, || Value::known(F::ZERO))?;
+                region.assign_fixed(|| "c2", self.c2, 0, || Value::known(-F::ONE))?;
+                region.assign_fixed(|| "cm", self.cm, 0, || Value::known(F::ONE))?;
+                region.assign_fixed(|| "cc", self.cc, 0, || Value::known(F::ZERO))?;
+
 
                 Ok(w2)
             },
@@ -137,9 +166,46 @@ impl<F: Field> ArithmeticChip<F> {
             },
         )
     }
+
+    fn eq_constant(
+        &self,
+        layouter: &mut impl Layouter<F>,
+        constant: F,
+        cell: AssignedCell<F, F>,
+    ) -> Result<(), Error> {
+        layouter.assign_region(
+            || "eq_constant",
+            |mut region| {
+                // assign the constant to the fixed column
+                let fixed_cell = region.assign_fixed(
+                    || "assign fixed", 
+                    self.cc, 
+                    0, 
+                    || Value::known(constant)
+                )?;
+
+                // constrain the cell to be equal to the constant
+                region.constrain_equal(cell.cell(), fixed_cell.cell())?; 
+
+                Ok(())
+            },
+        )
+    }
 }
 
-impl<F: Field> Circuit<F> for TestCircuit<F> {
+#[derive(Clone, Debug)]
+struct TestConfig<F: Field + Clone> {
+    _ph: PhantomData<F>,
+    arithmetic_chip: ArithmeticChip<F>,
+}
+
+#[derive(Clone, Debug)]
+struct TestCircuit<F: Field> {
+    _ph: PhantomData<F>,
+    secret: Value<F>
+}
+
+impl<F: PrimeField> Circuit<F> for TestCircuit<F> {
     type Config = TestConfig<F>;
     type FloorPlanner = SimpleFloorPlanner;
 
@@ -151,31 +217,36 @@ impl<F: Field> Circuit<F> for TestCircuit<F> {
     }
 
     fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
-        // define advice columns
+        // let q_enable = meta.fixed_column();
         let w0 = meta.advice_column();
         let w1 = meta.advice_column();
         let w2 = meta.advice_column();
+
+        let c0 = meta.fixed_column();
+        let c1 = meta.fixed_column();
+        let c2 = meta.fixed_column();
+        let cm = meta.fixed_column();
+        let cc = meta.fixed_column();
 
         // enable equality constraints
         meta.enable_equality(w0);
         meta.enable_equality(w1);
         meta.enable_equality(w2);
 
-        let arithmetic_chip = ArithmeticChip::configure(meta, w0, w1, w2);
+        meta.enable_equality(cc);
+
+        let arithmetic_chip = ArithmeticChip::configure(meta, c0, c1, c2, cm, cc, w0, w1, w2);
 
         TestConfig {
             _ph: PhantomData,
             arithmetic_chip,
-            w0,
-            w1,
-            w2,
         }
     }
 
     fn synthesize(
-    &self,
-    config: Self::Config, //
-    mut layouter: impl Layouter<F>,
+        &self,
+        config: Self::Config, //
+        mut layouter: impl Layouter<F>,
     ) -> Result<(), Error> {
         let a1 = config
             .arithmetic_chip
@@ -183,29 +254,18 @@ impl<F: Field> Circuit<F> for TestCircuit<F> {
 
         let a2 = config
             .arithmetic_chip
-            .mul(&mut layouter, a1.clone(), a1.clone())?;
+            .add(&mut layouter, a1.clone(), a1.clone())?;
 
         let a3 = config
             .arithmetic_chip
-            .add(&mut layouter, a1.clone(), a2.clone())?;
+            .mul(&mut layouter, a1.clone(), a2.clone())?;
+
+        config
+            .arithmetic_chip
+            .eq_constant(&mut layouter, F::from_u128(1337 * (1337 + 1337)), a3)?;
 
         Ok(())
     }
-}
-
-#[derive(Clone, Debug)]
-struct TestConfig<F: Field> {
-    _ph: PhantomData<F>,
-    arithmetic_chip: ArithmeticChip<F>,
-    w0: Column<Advice>,
-    w1: Column<Advice>,
-    w2: Column<Advice>,
-}
-
-#[derive(Clone, Debug)]
-struct TestCircuit<F: Field> {
-    _ph: PhantomData<F>,
-    secret: Value<F>,
 }
 
 fn main() {
@@ -214,7 +274,7 @@ fn main() {
     // Define a test circuit with a secret value
     let circuit = TestCircuit {
         _ph: PhantomData,
-        secret: Value::known(Fr::from(42)), // Example secret value
+        secret: Value::known(Fr::from(1337)), // Example secret value
     };
 
     // Create a mock prover to test the circuit
