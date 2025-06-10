@@ -60,7 +60,7 @@ struct ArithmeticChip<F: Field> {
     w2: Column<Advice>,
 }
 
-impl<F: Field> ArithmeticChip<F> {
+impl<F: PrimeField> ArithmeticChip<F> {
     fn configure(
         meta: &mut ConstraintSystem<F>,
         c0: Column<Fixed>,
@@ -263,6 +263,55 @@ impl<F: Field> ArithmeticChip<F> {
                 region.assign_advice(|| "assign w2", self.w2, 0, || Value::known(F::ZERO))?;
 
                 Ok(())
+            },
+        )
+    }
+
+    /// Allocate a bit-constrained variable.
+    fn bit(
+        &self,
+        layouter: &mut impl Layouter<F>,
+        value: Value<bool>,
+    ) -> Result<Variable<F>, Error> {
+        // ANCHOR_END: bit
+        layouter.assign_region(
+            || "bit",
+            |mut region| {
+                // turn on the arithmetic gate
+                self.q_arith.enable(&mut region, 0)?;
+
+                // (v1 - 1) * v1 = v1^2 - v1
+                let w0 = region.assign_advice(
+                    || "bit0",
+                    self.w0,
+                    0,
+                    || value.map(|b| if b { F::ONE } else { F::ZERO }),
+                )?;
+
+                let w1 = region.assign_advice(
+                    || "bit1",
+                    self.w1,
+                    0,
+                    || value.map(|b| if b { F::ONE } else { F::ZERO }),
+                )?;
+
+                region.assign_advice(|| "junk", self.w2, 0, || Value::known(F::ZERO))?;
+
+                region.constrain_equal(w0.cell(), w1.cell())?;
+
+                region.assign_fixed(|| "c0", self.c0, 0, || Value::known(F::ZERO))?;
+                region.assign_fixed(|| "c1", self.c1, 0, || Value::known(-F::ONE))?;
+                region.assign_fixed(|| "c2", self.c2, 0, || Value::known(F::ZERO))?;
+                region.assign_fixed(|| "cc", self.cc, 0, || Value::known(F::ZERO))?;
+                region.assign_fixed(|| "cm", self.cm, 0, || Value::known(F::ONE))?;
+
+                // 0 * w0 + (-1) * w1 + 0 * w2 + 1 * (w0 * w1) + 0 = 0
+
+                Ok(Variable {
+                    mul: F::ONE,
+                    add: F::ZERO,
+                    val: w0,
+                })
             },
         )
     }
