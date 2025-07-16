@@ -1,4 +1,4 @@
-use std::marker::PhantomData;
+use std::{marker::PhantomData, vec};
 
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
@@ -56,16 +56,6 @@ struct TestConfig<F: Field + Clone> {
     sbox: TableColumn,
 }
 
-fn subbytes(input: &Vec<u8>) -> Vec<u8> {
-    let mut output = vec![0u8; input.len()]; // Initialize with zeros
-    for i in 0..4 {
-        for j in 0..4 {
-            output[4*i+j] = SBOX[input[4*i+j] as usize];
-        }
-    }
-    output
-}
-
 impl<F: PrimeField> Circuit<F> for TestCircuit<F> {
     type Config = TestConfig<F>;
     type FloorPlanner = SimpleFloorPlanner;
@@ -87,13 +77,21 @@ impl<F: PrimeField> Circuit<F> for TestCircuit<F> {
         let ct = meta.advice_column();
         let key = meta.advice_column();
         let sbox = meta.lookup_table_column();
-
+        
         meta.create_gate("aes_round_encrypt", |meta| {
             let q_encrypt = meta.query_selector(q_encrypt);
             let pt_op = meta.query_advice(pt_op, Rotation::cur());
             let ct = meta.query_advice(ct, Rotation::cur());
 
             vec![q_encrypt * (pt_op - ct)]
+        });
+
+        // lookup that the S-box is applied correctly
+        meta.lookup("sbox_lookup", |meta| {
+            let pt_op = meta.query_advice(pt_op, Rotation::cur());
+            vec![
+                (pt_op, sbox)
+            ]
         });
 
         TestConfig {
@@ -150,6 +148,20 @@ impl<F: PrimeField> Circuit<F> for TestCircuit<F> {
                     )?;
 
                     region.assign_advice(
+                        || "plaintext operated",
+                        config.pt_op,
+                        i,
+                        || {
+                            self.pt.as_ref().map(|pt| {
+                                // set pt_op[i] = SBOX[pt[i]] looking up the value from sbox table column
+                                let pt_value = pt[i];
+                                let sbox_value = SBOX[pt_value as usize];
+                                F::from(sbox_value as u64)
+                            })
+                        }
+                    )?;
+
+                    region.assign_advice(
                         || "ciphertext",
                         config.ct,
                         i,
@@ -167,19 +179,6 @@ impl<F: PrimeField> Circuit<F> for TestCircuit<F> {
                         || {
                             self.key.as_ref().map(|key| {
                                 F::from(key[i] as u64)
-                            })
-                        }
-                    )?;
-
-                    let subbyte_result = self.pt.as_ref().map(|pt| subbytes(pt));
-
-                    region.assign_advice(
-                        || "subbytes output",
-                        config.pt_op,
-                        i,
-                        || {
-                            subbyte_result.as_ref().map(|result| {
-                                F::from(result[i] as u64)
                             })
                         }
                     )?;
